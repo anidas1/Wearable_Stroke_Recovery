@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Live EMG</title>
+  <script src="https://cdn.socket.io/4.7.5/socket.io.min.js" crossorigin="anonymous"></script>
+  <script src="https://cdn.plot.ly/plotly-2.27.0.min.js" crossorigin="anonymous"></script>
+  <style>
+    :root {
+      --bg: #1a1d23;
+      --panel: #242830;
+      --text: #e8eaed;
+      --muted: #9aa0a6;
+      --accent: #5c9ded;
+      --border: #3c4048;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.45;
+    }
+    header {
+      padding: 0.75rem 1.25rem;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+    }
+    header h1 { margin: 0; font-size: 1.1rem; font-weight: 600; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.5rem 0.75rem;
+      align-items: center;
+      padding: 0.75rem 1.25rem;
+      background: var(--panel);
+      border-bottom: 1px solid var(--border);
+    }
+    .toolbar label { color: var(--muted); font-size: 0.8rem; margin-right: 0.25rem; }
+    select, input[type="text"] {
+      background: var(--bg);
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.35rem 0.5rem;
+      min-width: 8rem;
+    }
+    button {
+      background: #3d4f6b;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 0.4rem 0.75rem;
+      cursor: pointer;
+      font-size: 0.85rem;
+    }
+    button:hover { filter: brightness(1.12); }
+    button.primary { background: #2e5a8a; border-color: #4a7ab8; }
+    button.danger { background: #6b3d3d; border-color: #8a4a4a; }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    .custom-label-group {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .preset-row {
+      display: inline-flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 0.35rem;
+    }
+    .preset-row > span.hint {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-right: 0.15rem;
+    }
+    button.btn-preset {
+      background: #323946;
+      min-width: 4.25rem;
+    }
+    button.btn-preset.active {
+      background: #3d5a80;
+      border-color: #6b9bd1;
+      box-shadow: 0 0 0 1px rgba(108, 155, 209, 0.35);
+    }
+    #plot { width: 100%; height: min(72vh, 720px); }
+    .status {
+      padding: 0.5rem 1.25rem;
+      font-size: 0.85rem;
+      color: var(--muted);
+      border-bottom: 1px solid var(--border);
+    }
+    .status strong { color: var(--text); }
+    #log {
+      margin: 0;
+      padding: 0.75rem 1.25rem;
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 0.72rem;
+      color: #a8b0bc;
+      max-height: 10rem;
+      overflow-y: auto;
+      background: #12141a;
+      border-top: 1px solid var(--border);
+      white-space: pre-wrap;
+    }
+  </style>
+</head>
+<body>
+  <header><h1>Live EMG — web</h1></header>
+  <div class="toolbar">
+    <span><label for="portSel">Port</label>
+      <select id="portSel"></select></span>
+    <button type="button" id="btnRefreshPorts">Refresh ports</button>
+    <button type="button" class="primary" id="btnConnect">Connect</button>
+    <button type="button" class="danger" id="btnDisconnect" disabled>Disconnect</button>
+    <span><label for="sessionName">Session</label>
+      <input type="text" id="sessionName" placeholder="session_web" value="session_web" /></span>
+    <span class="custom-label-group">
+      <label for="labelInput">Custom label</label>
+      <input type="text" id="labelInput" placeholder="type any label…" title="Type a label, then Set label or press Enter" />
+      <button type="button" id="btnSetLabel" title="Apply the text field as the active label">Set label</button>
+    </span>
+    <span class="preset-row">
+      <span class="hint">Presets</span>
+      <button type="button" class="btn-preset" data-label="rest" title="Set label to rest">rest</button>
+      <button type="button" class="btn-preset" data-label="reach" title="Set label to reach">reach</button>
+      <button type="button" class="btn-preset" data-label="misc" title="Set label to misc">misc</button>
+    </span>
+    <button type="button" class="primary" id="btnStart">Start recording</button>
+    <button type="button" id="btnStop">Stop recording</button>
+    <button type="button" id="btnSave">Save CSV</button>
+  </div>
+  <div class="status" id="statusLine">Connecting… (auto USB serial)</div>
+  <div id="plot"></div>
+  <pre id="log"></pre>
+
+  <script>
+(function () {
+  const WINDOW_SEC = 12;
+  const socket = io({ transports: ['websocket', 'polling'] });
+
+  const portSel = document.getElementById('portSel');
+  const btnRefresh = document.getElementById('btnRefreshPorts');
+  const btnConnect = document.getElementById('btnConnect');
+  const btnDisconnect = document.getElementById('btnDisconnect');
+  const sessionName = document.getElementById('sessionName');
+  const labelInput = document.getElementById('labelInput');
+  const btnSetLabel = document.getElementById('btnSetLabel');
+  const btnStart = document.getElementById('btnStart');
+  const btnStop = document.getElementById('btnStop');
+  const btnSave = document.getElementById('btnSave');
+  const statusLine = document.getElementById('statusLine');
+  const logEl = document.getElementById('log');
+  const presetButtons = document.querySelectorAll('.btn-preset');
+
+  function highlightPresetButtons(currentLabel) {
+    const low = String(currentLabel || '').toLowerCase();
+    presetButtons.forEach((b) => {
+      b.classList.toggle('active', b.getAttribute('data-label') === low);
+    });
+  }
+
+  function emitLabel(label) {
+    const t = String(label).trim();
+    if (!t) return;
+    labelInput.value = t;
+    socket.emit('set_label', { label: t });
+    highlightPresetButtons(t);
+  }
+
+  function log(msg) {
+    const t = new Date().toISOString().slice(11, 19);
+    logEl.textContent += `[${t}] ${msg}\n`;
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function predStr(p) {
+    if (p === 1) return 'REACH';
+    if (p === 0) return 'REST';
+    return '?';
+  }
+
+  async function loadPorts() {
+    try {
+      const r = await fetch('/api/ports');
+      const list = await r.json();
+      portSel.innerHTML = '';
+      if (!list.length) {
+        const o = document.createElement('option');
+        o.value = '';
+        o.textContent = '(no serial ports)';
+        portSel.appendChild(o);
+        return list;
+      }
+      for (const p of list) {
+        const o = document.createElement('option');
+        o.value = p.device;
+        o.textContent = p.description ? `${p.device} — ${p.description}` : p.device;
+        portSel.appendChild(o);
+      }
+      return list;
+    } catch (e) {
+      log('Ports fetch failed: ' + e);
+      return [];
+    }
+  }
+
+  /** Prefer ESP32/USB CDC; avoid Bluetooth; deprioritize generic debug-console if a USB device exists. */
+  function pickPreferredPort(list) {
+    if (!list || !list.length) return null;
+    const scored = list.map((p) => {
+      const dev = (p.device || '').toLowerCase();
+      const desc = (p.description || '').toLowerCase();
+      let s = 0;
+      if (dev.includes('bluetooth') || desc.includes('bluetooth')) s -= 200;
+      if (dev.includes('usbmodem') || dev.includes('usbserial') || dev.includes('tty.usb'))
+        s += 80;
+      if (desc.includes('jtag') || desc.includes('serial') || desc.includes('usb'))
+        s += 25;
+      if (desc.includes('debug-console') && list.length > 1) s -= 30;
+      return { device: p.device, s };
+    });
+    scored.sort((a, b) => b.s - a.s);
+    const best = scored[0];
+    return best && best.s > -100 ? best.device : null;
+  }
+
+  let serialOpen = false;
+  function tryConnectPreferredFromList(list) {
+    if (serialOpen) return false;
+    const port = pickPreferredPort(list);
+    if (!port) return false;
+    portSel.value = port;
+    log('Connecting → ' + port);
+    socket.emit('connect_serial', { port });
+    return true;
+  }
+
+  let autoStreamStarted = false;
+  async function autoConnectAndStream() {
+    if (autoStreamStarted) return;
+    autoStreamStarted = true;
+    const list = await loadPorts();
+    if (!tryConnectPreferredFromList(list)) {
+      if (!pickPreferredPort(list)) {
+        statusLine.textContent =
+          'No suitable USB serial port. Plug in the board and click Refresh ports (auto-connects).';
+        log('Auto-connect skipped: no USB-like port in list');
+        autoStreamStarted = false;
+      }
+    }
+  }
+
+  function sliceWindow(t, ch1, ch2, ch3, lda) {
+    if (!t.length) return { t, ch1, ch2, ch3, lda };
+    const tmax = t[t.length - 1];
+    const lo = tmax - WINDOW_SEC;
+    let i0 = 0;
+    while (i0 < t.length && t[i0] < lo) i0++;
+    return {
+      t: t.slice(i0),
+      ch1: ch1.slice(i0),
+      ch2: ch2.slice(i0),
+      ch3: ch3.slice(i0),
+      lda: lda.slice(i0),
+    };
+  }
+
+  function segmentShapes(segments, tLo) {
+    if (!segments || !segments.length) return [];
+    const yrefs = ['y', 'y2', 'y3', 'y4'];
+    const shapes = [];
+    for (const seg of segments) {
+      const x0 = Math.max(seg.t0, tLo);
+      const x1 = seg.t1;
+      if (x1 <= x0) continue;
+      const fill = seg.color || '#ccc';
+      for (const yref of yrefs) {
+        shapes.push({
+          type: 'rect',
+          xref: 'x',
+          yref: yref + ' domain',
+          x0, x1,
+          y0: 0, y1: 1,
+          fillcolor: fill,
+          opacity: 0.38,
+          line: { width: 0 },
+          layer: 'below',
+        });
+      }
+    }
+    return shapes;
+  }
+
+  const traces = [
+    { x: [], y: [], xaxis: 'x', yaxis: 'y', mode: 'lines', name: 'CH1', line: { color: '#e74c3c', width: 1 } },
+    { x: [], y: [], xaxis: 'x', yaxis: 'y2', mode: 'lines', name: 'CH2', line: { color: '#2ecc71', width: 1 } },
+    { x: [], y: [], xaxis: 'x', yaxis: 'y3', mode: 'lines', name: 'CH3', line: { color: '#3498db', width: 1 } },
+    { x: [], y: [], xaxis: 'x', yaxis: 'y4', mode: 'lines', name: 'LDA', line: { color: '#8e44ad', width: 1.2, shape: 'hv' } },
+  ];
+
+  const layout = {
+    paper_bgcolor: '#1a1d23',
+    plot_bgcolor: '#1e2229',
+    font: { color: '#c4c7cc', size: 11 },
+    margin: { t: 36, r: 16, b: 48, l: 52 },
+    showlegend: false,
+    xaxis: {
+      title: 'Time (s)',
+      domain: [0, 1],
+      anchor: 'y4',
+      gridcolor: '#3c4048',
+      zerolinecolor: '#3c4048',
+    },
+    yaxis: { title: 'CH1', domain: [0.78, 1], gridcolor: '#3c4048', zerolinecolor: '#3c4048' },
+    yaxis2: { title: 'CH2', domain: [0.52, 0.76], gridcolor: '#3c4048', zerolinecolor: '#3c4048' },
+    yaxis3: { title: 'CH3', domain: [0.26, 0.50], gridcolor: '#3c4048', zerolinecolor: '#3c4048' },
+    yaxis4: { title: 'LDA', domain: [0, 0.24], gridcolor: '#3c4048', zerolinecolor: '#3c4048', range: [-0.15, 1.15] },
+    shapes: [],
+  };
+
+  const config = { responsive: true, displayModeBar: true, scrollZoom: true };
+
+  Plotly.newPlot('plot', traces, layout, config).then((gd) => {
+    window._plotGd = gd;
+  });
+
+  socket.on('connect', () => {
+    log('Socket connected');
+    autoConnectAndStream();
+  });
+  socket.on('disconnect', () => log('Socket disconnected'));
+
+  socket.on('log', (d) => {
+    if (d && d.msg) log(d.msg);
+  });
+
+  socket.on('serial_state', (d) => {
+    serialOpen = !!(d && d.open);
+    btnConnect.disabled = serialOpen;
+    btnDisconnect.disabled = !serialOpen;
+    if (serialOpen) {
+      statusLine.textContent =
+        'Serial connected — waiting for EMG packets (R:/F:) from the device…';
+    } else {
+      statusLine.textContent =
+        'Serial disconnected. Refresh ports or Connect when the board is plugged in.';
+    }
+  });
+
+  socket.on('emg_batch', (payload) => {
+    if (!payload || !window._plotGd) return;
+    const t = payload.t || [];
+    const ch1 = payload.ch1 || [];
+    const ch2 = payload.ch2 || [];
+    const ch3 = payload.ch3 || [];
+    const lda = payload.lda || [];
+    const w = sliceWindow(t, ch1, ch2, ch3, lda);
+    const tLo = w.t.length ? w.t[0] : 0;
+    const shapes = segmentShapes(payload.segments || [], tLo);
+
+    const st = payload.status || {};
+    const rec = st.recording ? 'RECORDING' : 'paused';
+    const ldaOk = st.lda_ready ? '' : ' (LDA off)';
+    statusLine.innerHTML =
+      `<strong>${rec}</strong>${ldaOk} · label=<strong>${(st.label || '').replace(/</g, '')}</strong> · pred=<strong>${predStr(st.lda_pred)}</strong> · ` +
+      `buffer: ${(st.n_raw || 0).toLocaleString()} raw, ${(st.n_feat || 0)} feat`;
+    highlightPresetButtons(st.label);
+
+    const newLayout = Object.assign({}, layout, { shapes });
+    Plotly.react('plot', [
+      { x: w.t, y: w.ch1, xaxis: 'x', yaxis: 'y', mode: 'lines', name: 'CH1', line: { color: '#e74c3c', width: 1 } },
+      { x: w.t, y: w.ch2, xaxis: 'x', yaxis: 'y2', mode: 'lines', name: 'CH2', line: { color: '#2ecc71', width: 1 } },
+      { x: w.t, y: w.ch3, xaxis: 'x', yaxis: 'y3', mode: 'lines', name: 'CH3', line: { color: '#3498db', width: 1 } },
+      { x: w.t, y: w.lda, xaxis: 'x', yaxis: 'y4', mode: 'lines', name: 'LDA', line: { color: '#8e44ad', width: 1.2, shape: 'hv' } },
+    ], newLayout, config);
+  });
+
+  btnRefresh.addEventListener('click', async () => {
+    const list = await loadPorts();
+    if (!serialOpen) tryConnectPreferredFromList(list);
+  });
+  btnConnect.addEventListener('click', () => {
+    const port = portSel.value;
+    if (!port) {
+      log('Pick a port');
+      return;
+    }
+    socket.emit('connect_serial', { port });
+  });
+  btnDisconnect.addEventListener('click', () => socket.emit('disconnect_serial'));
+  presetButtons.forEach((btn) => {
+    btn.addEventListener('click', () => {
+      emitLabel(btn.getAttribute('data-label') || '');
+    });
+  });
+  btnSetLabel.addEventListener('click', () => {
+    emitLabel(labelInput.value);
+  });
+  labelInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      emitLabel(labelInput.value);
+    }
+  });
+  btnStart.addEventListener('click', () => socket.emit('start_recording'));
+  btnStop.addEventListener('click', () => socket.emit('stop_recording'));
+  btnSave.addEventListener('click', () => {
+    const s = sessionName.value.trim() || 'session_web';
+    socket.emit('save_csv', { session: s });
+  });
+
+  if (socket.connected) {
+    autoConnectAndStream();
+  }
+})();
+  </script>
+</body>
+</html>
