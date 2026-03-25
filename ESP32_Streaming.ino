@@ -1,9 +1,7 @@
 // sampler_features.ino
 // 3-channel RAW EMG, GPIO4 + GPIO7 + GPIO10
-// Output:
-//   R:timestamp,raw1,raw2,raw3        — every sample at 2kHz
-//   F:f0..f23,prediction              — every 100ms window
-// Motor trigger: GPIO17 HIGH=REACH LOW=REST
+// Modes: 'p' = plotter, 'r' = normal stream, 'i' = inference + motor trigger
+// Motor trigger: GPIO17 HIGH = REACH, LOW = REST
 
 #include <Arduino.h>
 #include <math.h>
@@ -14,7 +12,7 @@
 #define RAW1_PIN    4
 #define RAW2_PIN    7
 #define RAW3_PIN    10
-#define SIGNAL_PIN  17
+#define SIGNAL_PIN  17  // HIGH = REACH, LOW = REST → Arduino pin 2
 
 // ─────────────────────────────────────────────────────────────────────
 // SAMPLING CONFIG
@@ -33,6 +31,14 @@
 #define SSC_THRESH   30.0f
 
 // ─────────────────────────────────────────────────────────────────────
+// MODE
+// ─────────────────────────────────────────────────────────────────────
+#define MODE_NORMAL   0
+#define MODE_PLOTTER  1
+#define MODE_INFER    2
+int mode = MODE_NORMAL;
+
+// ─────────────────────────────────────────────────────────────────────
 // TIMER
 // ─────────────────────────────────────────────────────────────────────
 hw_timer_t*   timer       = NULL;
@@ -48,7 +54,6 @@ bool  bufFull = false;
 
 // ─────────────────────────────────────────────────────────────────────
 // FEATURE EXTRACTION
-// Order: MAV, RMS, VAR, PEAK, WL, WAMP, ZC, SSC
 // ─────────────────────────────────────────────────────────────────────
 void extractFeatures(const float* w, int len, float* out) {
   float dc = 0;
@@ -123,7 +128,7 @@ int ldaPredict(float* feat) {
   float score = lda_intercept[0];
   for (int i = 0; i < 24; i++)
     score += lda_coef[0][i] * x[i];
-  return (score > 0) ? 1 : 0;
+  return (score > 1.5) ? 1 : 0;
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -149,14 +154,21 @@ void setup() {
   timerAlarm(timer, 1, true, 0);
 
   Serial.println("# sampler_features — 3ch RAW GPIO4+GPIO7+GPIO10");
-  Serial.println("# R:timestamp,raw1,raw2,raw3");
-  Serial.println("# F:f0..f23,prediction");
+  Serial.println("# 'p' = plotter  'r' = normal  'i' = inference");
+  Serial.println("# GPIO17 HIGH=REACH LOW=REST");
 }
 
 // ─────────────────────────────────────────────────────────────────────
 // LOOP
 // ─────────────────────────────────────────────────────────────────────
 void loop() {
+  if (Serial.available()) {
+    char cmd = Serial.read();
+    if      (cmd == 'p') { mode = MODE_PLOTTER; Serial.println("Deltoid_RAW\tTricep_RAW\tForearm_RAW"); }
+    else if (cmd == 'r') { mode = MODE_NORMAL;  Serial.println("# MODE: NORMAL"); }
+    else if (cmd == 'i') { mode = MODE_INFER;   Serial.println("# MODE: INFERENCE"); }
+  }
+
   if (!sampleReady) return;
   sampleReady = false;
 
@@ -165,10 +177,9 @@ void loop() {
   float s2   = analogRead(RAW2_PIN);
   float s3   = analogRead(RAW3_PIN);
 
-  // Stream raw every sample
-  Serial.printf("R:%lu,%.0f,%.0f,%.0f\n", t, s1, s2, s3);
+  if      (mode == MODE_PLOTTER) Serial.printf("%.0f\t%.0f\t%.0f\n", s1, s2, s3);
+  else if (mode == MODE_NORMAL)  Serial.printf("R:%lu,%.0f,%.0f,%.0f\n", t, s1, s2, s3);
 
-  // Fill window buffer
   buf[0][bufIdx] = s1;
   buf[1][bufIdx] = s2;
   buf[2][bufIdx] = s3;
@@ -181,16 +192,22 @@ void loop() {
   float feat[TOTAL_FEATURES];
   extractAllChannels(buf, feat);
 
-  int pred = ldaPredict(feat);
+  if (mode == MODE_NORMAL) {
+    Serial.print("F:");
+    for (int i = 0; i < TOTAL_FEATURES; i++) {
+      Serial.print(feat[i], 4);
+      if (i < TOTAL_FEATURES - 1) Serial.print(",");
+    }
+    Serial.println();
 
-  // Motor trigger
-  digitalWrite(SIGNAL_PIN, pred == 1 ? HIGH : LOW);
-
-  // Stream features + prediction
-  Serial.print("F:");
-  for (int i = 0; i < TOTAL_FEATURES; i++) {
-    Serial.print(feat[i], 4);
-    if (i < TOTAL_FEATURES - 1) Serial.print(",");
+  } else if (mode == MODE_INFER) {
+    int pred = ldaPredict(feat);
+    if (pred == 1) {
+      Serial.println("REACH");
+      digitalWrite(SIGNAL_PIN, HIGH);  // stays HIGH until REST
+    } else {
+      Serial.println("REST");
+      digitalWrite(SIGNAL_PIN, LOW);   // drops LOW on REST
+    }
   }
-  Serial.println(pred == 1 ? ",REACH" : ",REST");
 }
