@@ -1,7 +1,9 @@
 // sampler_features.ino
 // 3-channel RAW EMG, GPIO4 + GPIO7 + GPIO10
-// Output: one CSV line per 100ms window
-// Format: timestamp_us,f0..f23,prediction
+// Output:
+//   R:timestamp,raw1,raw2,raw3        — every sample at 2kHz
+//   F:f0..f23,prediction              — every 100ms window
+// Motor trigger: GPIO17 HIGH=REACH LOW=REST
 
 #include <Arduino.h>
 #include <math.h>
@@ -41,12 +43,12 @@ void IRAM_ATTR onTimer()  { sampleReady = true; }
 // WINDOW BUFFER
 // ─────────────────────────────────────────────────────────────────────
 float buf[NUM_CHANNELS][WINDOW_SIZE];
-int      bufIdx      = 0;
-bool     bufFull     = false;
-uint32_t windowStart = 0;  // timestamp of first sample in window
+int   bufIdx  = 0;
+bool  bufFull = false;
 
 // ─────────────────────────────────────────────────────────────────────
 // FEATURE EXTRACTION
+// Order: MAV, RMS, VAR, PEAK, WL, WAMP, ZC, SSC
 // ─────────────────────────────────────────────────────────────────────
 void extractFeatures(const float* w, int len, float* out) {
   float dc = 0;
@@ -146,10 +148,9 @@ void setup() {
   timerAttachInterrupt(timer, &onTimer);
   timerAlarm(timer, 1, true, 0);
 
-  // Print CSV header
-  Serial.print("timestamp_us");
-  for (int i = 0; i < TOTAL_FEATURES; i++) Serial.printf(",f%d", i);
-  Serial.println(",prediction");
+  Serial.println("# sampler_features — 3ch RAW GPIO4+GPIO7+GPIO10");
+  Serial.println("# R:timestamp,raw1,raw2,raw3");
+  Serial.println("# F:f0..f23,prediction");
 }
 
 // ─────────────────────────────────────────────────────────────────────
@@ -159,13 +160,15 @@ void loop() {
   if (!sampleReady) return;
   sampleReady = false;
 
-  float s1 = analogRead(RAW1_PIN);
-  float s2 = analogRead(RAW2_PIN);
-  float s3 = analogRead(RAW3_PIN);
+  uint32_t t = micros();
+  float s1   = analogRead(RAW1_PIN);
+  float s2   = analogRead(RAW2_PIN);
+  float s3   = analogRead(RAW3_PIN);
 
-  // Record timestamp of first sample in window
-  if (bufIdx == 0) windowStart = micros();
+  // Stream raw every sample
+  Serial.printf("R:%lu,%.0f,%.0f,%.0f\n", t, s1, s2, s3);
 
+  // Fill window buffer
   buf[0][bufIdx] = s1;
   buf[1][bufIdx] = s2;
   buf[2][bufIdx] = s3;
@@ -183,11 +186,11 @@ void loop() {
   // Motor trigger
   digitalWrite(SIGNAL_PIN, pred == 1 ? HIGH : LOW);
 
-  // Single CSV line: timestamp, features, prediction
-  Serial.print(windowStart);
+  // Stream features + prediction
+  Serial.print("F:");
   for (int i = 0; i < TOTAL_FEATURES; i++) {
-    Serial.print(",");
     Serial.print(feat[i], 4);
+    if (i < TOTAL_FEATURES - 1) Serial.print(",");
   }
   Serial.println(pred == 1 ? ",REACH" : ",REST");
 }
