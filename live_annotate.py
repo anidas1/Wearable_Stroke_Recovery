@@ -1,9 +1,9 @@
 """
 live_annotate.py
-Reads ESP32 CSV stream, lets you type labels in real time
+Reads ESP32 dual-stream (R: raw + F: features), lets you type labels in real time
 Saves two CSVs:
   {name}{session}_feat.csv  — features + lda_pred + user_label
-  {name}{session}_log.csv   — timestamp + lda_pred + user_label only
+  {name}{session}_raw.csv   — raw ADC + user_label
 """
 
 import serial
@@ -24,7 +24,7 @@ NUM_FEATURES = 24
 # SHARED STATE
 # ─────────────────────────────────────────────────────────────────────
 feat_buffer   = []
-log_buffer    = []
+raw_buffer    = []
 current_label = "unlabeled"
 running       = True
 lock          = threading.Lock()
@@ -44,13 +44,13 @@ def select_port():
     return ports[int(input("Select port: "))].device
 
 # ─────────────────────────────────────────────────────────────────────
-# ANNOTATION THREAD — type labels while recording
+# ANNOTATION THREAD
 # ─────────────────────────────────────────────────────────────────────
 def annotation_thread():
     global current_label, running
     print("\n  ── Label controls ──────────────────────────")
-    print("  Type any label + Enter to set it")
-    print("  Common: 'rest'  'reach'  'jerk'  'noise'")
+    print("  Type any label + Enter to set it instantly")
+    print("  Common: 'rest'  'reach'  'jerk'  'noise'  'misc'")
     print("  Type 'done' to stop recording")
     print("  ────────────────────────────────────────────\n")
     while running:
@@ -63,7 +63,8 @@ def annotation_thread():
                 break
             with lock:
                 current_label = text.lower()
-            print(f"  → [{datetime.now().strftime('%H:%M:%S')}] Label: '{current_label}'")
+            print(f"  → [{datetime.now().strftime('%H:%M:%S')}] "
+                  f"Label set to: '{current_label}'")
         except EOFError:
             break
 
@@ -74,7 +75,6 @@ def save_feat_csv(filename):
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["timestamp_us"] +
             [f"f{i}" for i in range(NUM_FEATURES)] +
             ["lda_pred", "user_label"]
         )
@@ -82,13 +82,13 @@ def save_feat_csv(filename):
             writer.writerow(row)
     print(f"✓ Feat saved : {filename}  ({len(feat_buffer)} windows)")
 
-def save_log_csv(filename):
+def save_raw_csv(filename):
     with open(filename, "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["timestamp_us", "lda_pred", "user_label"])
-        for row in log_buffer:
+        writer.writerow(["timestamp_us", "raw1", "raw2", "raw3", "user_label"])
+        for row in raw_buffer:
             writer.writerow(row)
-    print(f"✓ Log  saved : {filename}  ({len(log_buffer)} entries)")
+    print(f"✓ Raw  saved : {filename}  ({len(raw_buffer):,} samples)")
 
 # ─────────────────────────────────────────────────────────────────────
 # MAIN
@@ -104,7 +104,7 @@ def main():
     session  = input("  Session number: ").strip() or "1"
 
     feat_filename = f"{subject}{session}_feat.csv"
-    log_filename  = f"{subject}{session}_log.csv"
+    raw_filename  = f"{subject}{session}_raw.csv"
 
     port = select_port()
 
@@ -117,58 +117,84 @@ def main():
     except serial.SerialException as e:
         print(f"✗ {e}"); sys.exit(1)
 
-    # Start annotation input thread
+    # Sniff to confirm stream
+    print("  Sniffing stream (2s)...")
+    sniff_end  = time.time() + 2.0
+    r_count, f_count = 0, 0
+    while time.time() < sniff_end:
+        line = ser.readline().decode("utf-8", errors="ignore").strip()
+        if line and not line.startswith("#"):
+            if line.startswith("R:"): r_count += 1
+            if line.startswith("F:"): f_count += 1
+            if r_count + f_count <= 5:
+                print(f"    {repr(line)}")
+    print(f"  R: lines={r_count}  F: lines={f_count}")
+    if r_count == 0 and f_count == 0:
+        print("  WARNING: No data — check firmware and baud rate")
+    ser.reset_input_buffer()
+
+    # Start annotation thread
     ann_thread = threading.Thread(target=annotation_thread, daemon=True)
     ann_thread.start()
 
-    print(f"  {'TIME':>8}  {'LDA':>6}  {'LABEL':<15}  WINDOW")
-    print("  " + "─"*50)
+    print(f"\n  {'TIME':>8}  {'LDA':>6}  {'LABEL':<15}  {'WINDOWS':>7}  {'SAMPLES':>8}")
+    print("  " + "─"*58)
 
-    header_skipped = False
-    window_count   = 0
+    window_count = 0
+    sample_count = 0
 
     try:
         while running:
             line = ser.readline().decode("utf-8", errors="ignore").strip()
-            if not line:
-                continue
-
-            # Skip header line
-            if not header_skipped:
-                if line.startswith("timestamp"):
-                    header_skipped = True
-                continue
-
-            parts = line.split(",")
-
-            # Expect: timestamp, f0..f23, prediction = 26 fields
-            if len(parts) != NUM_FEATURES + 2:
-                continue
-
-            try:
-                ts   = int(parts[0])
-                feat = [float(p) for p in parts[1:NUM_FEATURES+1]]
-                pred = parts[NUM_FEATURES + 1].strip()
-            except (ValueError, IndexError):
+            if not line or line.startswith("#"):
                 continue
 
             with lock:
                 label = current_label
 
-            # Save to buffers
-            feat_buffer.append([ts] + feat + [pred, label])
-            log_buffer.append([ts, pred, label])
-            window_count += 1
+            # ── Raw sample ────────────────────────────────────────
+            if line.startswith("R:"):
+                parts = line[2:].split(",")
+                if len(parts) == 4:
+                    try:
+                        raw_buffer.append([
+                            int(parts[0]),
+                            float(parts[1]),
+                            float(parts[2]),
+                            float(parts[3]),
+                            label
+                        ])
+                        sample_count += 1
+                    except ValueError:
+                        pass
 
-            # Auto-save every 100 windows
-            if window_count % 100 == 0:
-                save_feat_csv(feat_filename)
-                save_log_csv(log_filename)
-                print(f"  💾 Auto-saved ({window_count} windows)")
+            # ── Feature window ────────────────────────────────────
+            elif line.startswith("F:"):
+                parts = line[2:].split(",")
+                if len(parts) == NUM_FEATURES + 1:
+                    try:
+                        feats = [float(p) for p in parts[:NUM_FEATURES]]
+                        pred  = parts[NUM_FEATURES].strip()
+                        feat_buffer.append(feats + [pred, label])
+                        window_count += 1
 
-            # Live display
-            t_str = datetime.now().strftime("%H:%M:%S")
-            print(f"  {t_str}  {pred:>6}  {label:<15}  #{window_count}")
+                        # Auto-save every 100 windows
+                        if window_count % 100 == 0:
+                            save_feat_csv(feat_filename)
+                            save_raw_csv(raw_filename)
+                            print(f"  💾 Auto-saved "
+                                  f"({window_count} windows, "
+                                  f"{sample_count:,} samples)")
+
+                        # Live display — update on every feature window
+                        t_str = datetime.now().strftime("%H:%M:%S")
+                        print(f"  {t_str}  {pred:>6}  "
+                              f"{label:<15}  "
+                              f"{window_count:>7}  "
+                              f"{sample_count:>8,}")
+
+                    except ValueError:
+                        pass
 
     except KeyboardInterrupt:
         print("\n\nCtrl+C — stopping...")
@@ -176,33 +202,18 @@ def main():
         running = False
         ser.close()
         save_feat_csv(feat_filename)
-        save_log_csv(log_filename)
+        save_raw_csv(raw_filename)
 
+    # ── Summary ───────────────────────────────────────────────────
     print("\n" + "="*55)
     print("  DONE")
     print("="*55)
     print(f"  Windows recorded : {window_count}")
-    print(f"  Labels used      : {sorted(set(r[-1] for r in log_buffer))}")
+    print(f"  Samples recorded : {sample_count:,}")
+    labels_used = sorted(set(r[-1] for r in feat_buffer))
+    print(f"  Labels used      : {labels_used}")
     print(f"  Feat file        : {feat_filename}")
-    print(f"  Log  file        : {log_filename}")
+    print(f"  Raw  file        : {raw_filename}")
 
 if __name__ == "__main__":
     main()
-```
-
-**Usage:**
-1. Flash ESP32, open this script
-2. Enter name and session number
-3. Terminal shows live stream — type labels freely:
-```
-  TIME      LDA    LABEL            WINDOW
-  ──────────────────────────────────────────
-  14:23:01  REST   unlabeled        #1
-  14:23:01  REST   unlabeled        #2
-→ reach          ← you type this
-  → Label: 'reach'
-  14:23:02  REACH  reach            #3
-  14:23:02  REACH  reach            #4
-→ rest
-  → Label: 'rest'
-  14:23:03  REST   rest             #5
